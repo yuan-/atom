@@ -300,7 +300,7 @@ TextEditorComponent = React.createClass
     [renderedStartRow, renderedEndRow] = renderedRowRange
 
     cursorPixelRects = {}
-    for selection in editor.getSelections() when selection.isEmpty()
+    for selection in editor.getSelections()
       {cursor} = selection
       screenRange = cursor.getScreenRange()
       if renderedStartRow <= screenRange.start.row < renderedEndRow

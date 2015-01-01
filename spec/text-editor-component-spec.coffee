@@ -772,15 +772,6 @@ describe "TextEditorComponent", ->
       advanceClock(component.props.cursorBlinkPeriod / 2)
       expect(cursorsNode.classList.contains('blink-off')).toBe true
 
-    it "does not render cursors that are associated with non-empty selections", ->
-      editor.setSelectedScreenRange([[0, 4], [4, 6]])
-      editor.addCursorAtScreenPosition([6, 8])
-      nextAnimationFrame()
-
-      cursorNodes = componentNode.querySelectorAll('.cursor')
-      expect(cursorNodes.length).toBe 1
-      expect(cursorNodes[0].style['-webkit-transform']).toBe "translate(#{8 * charWidth}px, #{6 * lineHeightInPixels}px)"
-
     it "updates cursor positions when the line height changes", ->
       editor.setCursorBufferPosition([1, 10])
       component.setLineHeight(2)
