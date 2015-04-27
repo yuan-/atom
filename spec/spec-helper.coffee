@@ -17,13 +17,14 @@ Config = require '../src/config'
 {Point} = require 'text-buffer'
 Project = require '../src/project'
 Workspace = require '../src/workspace'
+ServiceHub = require 'service-hub'
 TextEditor = require '../src/text-editor'
 TextEditorView = require '../src/text-editor-view'
 TextEditorElement = require '../src/text-editor-element'
 TokenizedBuffer = require '../src/tokenized-buffer'
 TextEditorComponent = require '../src/text-editor-component'
 pathwatcher = require 'pathwatcher'
-clipboard = require 'clipboard'
+clipboard = require '../src/safe-clipboard'
 
 atom.themes.loadBaseStylesheets()
 atom.themes.requireStylesheet '../static/jasmine'
@@ -50,7 +51,7 @@ Object.defineProperty document, 'title',
 
 jasmine.getEnv().addEqualityTester(_.isEqual) # Use underscore's definition of equality for toEqual assertions
 
-if process.env.JANKY_SHA1 and process.platform is 'win32'
+if process.env.CI
   jasmine.getEnv().defaultTimeoutInterval = 60000
 else
   jasmine.getEnv().defaultTimeoutInterval = 5000
@@ -68,18 +69,19 @@ if specDirectory
     specPackageName = JSON.parse(fs.readFileSync(path.join(specPackagePath, 'package.json')))?.name
   specProjectPath = path.join(specDirectory, 'fixtures')
 
-isCoreSpec = specDirectory == fs.realpathSync(__dirname)
+isCoreSpec = specDirectory is fs.realpathSync(__dirname)
 
 beforeEach ->
-  Grim.clearDeprecations() if isCoreSpec
   $.fx.off = true
   documentTitle = null
   projectPath = specProjectPath ? path.join(@specDirectory, 'fixtures')
+  atom.packages.serviceHub = new ServiceHub
   atom.project = new Project(paths: [projectPath])
   atom.workspace = new Workspace()
   atom.keymaps.keyBindings = _.clone(keyBindingsToRestore)
   atom.commands.restoreSnapshot(commandsToRestore)
   atom.styles.restoreSnapshot(styleElementsToRestore)
+  atom.views.clearDocumentRequests()
 
   atom.workspaceViewParentSelector = '#jasmine-content'
 
@@ -119,6 +121,7 @@ beforeEach ->
     "package-with-broken-package-json", "package-with-broken-keymap"]
   config.set "editor.useShadowDOM", true
   advanceClock(1000)
+  window.setTimeout.reset()
   config.load.reset()
   config.save.reset()
 
@@ -160,7 +163,6 @@ afterEach ->
 
   jasmine.unspy(atom, 'saveSync')
   ensureNoPathSubscriptions()
-  atom.grammars.clearObservers()
   waits(0) # yield to ui thread to make screen update more frequently
 
 ensureNoPathSubscriptions = ->
@@ -207,10 +209,15 @@ jasmine.attachToDOM = (element) ->
 
 deprecationsSnapshot = null
 jasmine.snapshotDeprecations = ->
-  deprecationsSnapshot = Grim.getDeprecations() # suppress deprecations!!
+  deprecationsSnapshot = _.clone(Grim.deprecations)
 
 jasmine.restoreDeprecationsSnapshot = ->
-  Grim.grimDeprecations = deprecationsSnapshot
+  Grim.deprecations = deprecationsSnapshot
+
+jasmine.useRealClock = ->
+  jasmine.unspy(window, 'setTimeout')
+  jasmine.unspy(window, 'clearTimeout')
+  jasmine.unspy(_._, 'now')
 
 addCustomMatchers = (spec) ->
   spec.addMatchers
@@ -226,7 +233,7 @@ addCustomMatchers = (spec) ->
       else
         notText = if @isNot then " not" else ""
         this.message = => "Expected object with length #{@actual.length} to#{notText} have length #{expected}"
-        @actual.length == expected
+        @actual.length is expected
 
     toExistOnDisk: (expected) ->
       notText = this.isNot and " not" or ""
@@ -289,7 +296,7 @@ window.mousemoveEvent = (properties={}) ->
 
 window.waitsForPromise = (args...) ->
   if args.length > 1
-    { shouldReject, timeout } = args[0]
+    {shouldReject, timeout} = args[0]
   else
     shouldReject = false
   fn = _.last(args)
@@ -297,13 +304,13 @@ window.waitsForPromise = (args...) ->
   window.waitsFor timeout, (moveOn) ->
     promise = fn()
     if shouldReject
-      promise.fail(moveOn)
-      promise.done ->
+      promise.catch.call(promise, moveOn)
+      promise.then ->
         jasmine.getEnv().currentSpec.fail("Expected promise to be rejected, but it was resolved")
         moveOn()
     else
-      promise.done(moveOn)
-      promise.fail (error) ->
+      promise.then(moveOn)
+      promise.catch.call promise, (error) ->
         jasmine.getEnv().currentSpec.fail("Expected promise to be resolved, but it was rejected with #{jasmine.pp(error)}")
         moveOn()
 
@@ -320,7 +327,7 @@ window.fakeSetTimeout = (callback, ms) ->
   id
 
 window.fakeClearTimeout = (idToClear) ->
-  window.timeouts = window.timeouts.filter ([id]) -> id != idToClear
+  window.timeouts = window.timeouts.filter ([id]) -> id isnt idToClear
 
 window.fakeSetInterval = (callback, ms) ->
   id = ++window.intervalCount
@@ -350,7 +357,7 @@ window.pagePixelPositionForPoint = (editorView, point) ->
   point = Point.fromObject point
   top = editorView.renderedLines.offset().top + point.row * editorView.lineHeight
   left = editorView.renderedLines.offset().left + point.column * editorView.charWidth - editorView.renderedLines.scrollLeft()
-  { top, left }
+  {top, left}
 
 window.tokensText = (tokens) ->
   _.pluck(tokens, 'value').join('')
@@ -361,7 +368,7 @@ window.setEditorWidthInChars = (editorView, widthInChars, charWidth=editorView.c
 
 window.setEditorHeightInLines = (editorView, heightInLines, lineHeight=editorView.lineHeight) ->
   editorView.height(editorView.getEditor().getLineHeightInPixels() * heightInLines)
-  editorView.component?.measureHeightAndWidth()
+  editorView.component?.measureDimensions()
 
 $.fn.resultOfTrigger = (type) ->
   event = $.Event(type)

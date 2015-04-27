@@ -10,15 +10,20 @@ describe "TextEditorElement", ->
     jasmineContent = document.body.querySelector('#jasmine-content')
 
   describe "instantiation", ->
-    it "honors the mini attribute", ->
+    it "honors the 'mini' attribute", ->
       jasmineContent.innerHTML = "<atom-text-editor mini>"
       element = jasmineContent.firstChild
       expect(element.getModel().isMini()).toBe true
 
-    it "honors the placeholder-text attribute", ->
+    it "honors the 'placeholder-text' attribute", ->
       jasmineContent.innerHTML = "<atom-text-editor placeholder-text='testing'>"
       element = jasmineContent.firstChild
       expect(element.getModel().getPlaceholderText()).toBe 'testing'
+
+    it "honors the 'gutter-hidden' attribute", ->
+      jasmineContent.innerHTML = "<atom-text-editor gutter-hidden>"
+      element = jasmineContent.firstChild
+      expect(element.getModel().isLineNumberGutterVisible()).toBe false
 
     it "honors the text content", ->
       jasmineContent.innerHTML = "<atom-text-editor>testing</atom-text-editor>"
@@ -41,9 +46,12 @@ describe "TextEditorElement", ->
         jasmine.attachToDOM(element)
 
         component = element.component
-        expect(component.isMounted()).toBe true
-        element.getModel().destroy()
-        expect(component.isMounted()).toBe false
+        expect(component.mounted).toBe true
+        element.remove()
+        expect(component.mounted).toBe false
+
+        jasmine.attachToDOM(element)
+        expect(element.component.mounted).toBe true
 
     describe "when the editor.useShadowDOM config option is false", ->
       it "mounts the react component and unmounts when removed from the dom", ->
@@ -53,9 +61,9 @@ describe "TextEditorElement", ->
         jasmine.attachToDOM(element)
 
         component = element.component
-        expect(component.isMounted()).toBe true
+        expect(component.mounted).toBe true
         element.getModel().destroy()
-        expect(component.isMounted()).toBe false
+        expect(component.mounted).toBe false
 
   describe "focus and blur handling", ->
     describe "when the editor.useShadowDOM config option is true", ->
@@ -95,6 +103,22 @@ describe "TextEditorElement", ->
         document.body.focus()
         expect(blurCalled).toBe true
 
+    describe "when focused while a parent node is being attached to the DOM", ->
+      class ElementThatFocusesChild extends HTMLDivElement
+        attachedCallback: ->
+          @firstChild.focus()
+
+      document.registerElement("element-that-focuses-child",
+        prototype: ElementThatFocusesChild.prototype
+      )
+
+      it "proxies the focus event to the hidden input", ->
+        element = new TextEditorElement
+        parentElement = document.createElement("element-that-focuses-child")
+        parentElement.appendChild(element)
+        jasmineContent.appendChild(parentElement)
+        expect(element.shadowRoot.activeElement).toBe element.shadowRoot.querySelector('input')
+
   describe "when the themes finish loading", ->
     [themeReloadCallback, initialThemeLoadComplete, element] = []
 
@@ -104,7 +128,7 @@ describe "TextEditorElement", ->
 
       spyOn(atom.themes, 'isInitialLoadComplete').andCallFake ->
         initialThemeLoadComplete
-      spyOn(atom.themes, 'onDidReloadAll').andCallFake (fn) ->
+      spyOn(atom.themes, 'onDidChangeActiveThemes').andCallFake (fn) ->
         themeReloadCallback = fn
 
       atom.config.set("editor.useShadowDOM", false)

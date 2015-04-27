@@ -1,6 +1,7 @@
 autoUpdater = null
 _ = require 'underscore-plus'
 {EventEmitter} = require 'events'
+path = require 'path'
 
 IdleState = 'idle'
 CheckingState = 'checking'
@@ -21,6 +22,7 @@ class AutoUpdateManager
       # https://github.com/Squirrel/Squirrel.Windows/issues/132
       @feedUrl = 'https://atom.io/api/updates'
     else
+      @iconPath = path.resolve(__dirname, '..', '..', 'resources', 'atom.png')
       @feedUrl = "https://atom.io/api/updates?version=#{@version}"
 
     process.nextTick => @setupAutoUpdater()
@@ -30,6 +32,10 @@ class AutoUpdateManager
       autoUpdater = require './auto-updater-win32'
     else
       autoUpdater = require 'auto-updater'
+
+    autoUpdater.on 'error', (event, message) =>
+      @setState(ErrorState)
+      console.error "Error Downloading Update: #{message}"
 
     autoUpdater.setFeedUrl @feedUrl
 
@@ -42,17 +48,12 @@ class AutoUpdateManager
     autoUpdater.on 'update-available', =>
       @setState(DownladingState)
 
-    autoUpdater.on 'error', (event, message) =>
-      @setState(ErrorState)
-      console.error "Error Downloading Update: #{message}"
-
-    autoUpdater.on 'update-downloaded', (event, @releaseNotes, @releaseVersion) =>
+    autoUpdater.on 'update-downloaded', (event, releaseNotes, @releaseVersion) =>
       @setState(UpdateAvailableState)
       @emitUpdateAvailableEvent(@getWindows()...)
 
     # Only released versions should check for updates.
-    unless /\w{7}/.test(@version)
-      @check(hidePopups: true)
+    @check(hidePopups: true) unless /\w{7}/.test(@version)
 
     switch process.platform
       when 'win32'
@@ -61,9 +62,10 @@ class AutoUpdateManager
         @setState(UnsupportedState)
 
   emitUpdateAvailableEvent: (windows...) ->
-    return unless @releaseVersion? and @releaseNotes
+    return unless @releaseVersion?
     for atomWindow in windows
-      atomWindow.sendMessage('update-available', {@releaseVersion, @releaseNotes})
+      atomWindow.sendMessage('update-available', {@releaseVersion})
+    return
 
   setState: (state) ->
     return if @state is state
@@ -86,12 +88,24 @@ class AutoUpdateManager
   onUpdateNotAvailable: =>
     autoUpdater.removeListener 'error', @onUpdateError
     dialog = require 'dialog'
-    dialog.showMessageBox type: 'info', buttons: ['OK'], message: 'No update available.', detail: "Version #{@version} is the latest version."
+    dialog.showMessageBox
+      type: 'info'
+      buttons: ['OK']
+      icon: @iconPath
+      message: 'No update available.'
+      title: 'No Update Available'
+      detail: "Version #{@version} is the latest version."
 
   onUpdateError: (event, message) =>
     autoUpdater.removeListener 'update-not-available', @onUpdateNotAvailable
     dialog = require 'dialog'
-    dialog.showMessageBox type: 'warning', buttons: ['OK'], message: 'There was an error checking for updates.', detail: message
+    dialog.showMessageBox
+      type: 'warning'
+      buttons: ['OK']
+      icon: @iconPath
+      message: 'There was an error checking for updates.'
+      title: 'Update Error'
+      detail: message
 
   getWindows: ->
     global.atomApplication.windows

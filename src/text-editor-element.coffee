@@ -1,9 +1,9 @@
 {Emitter} = require 'event-kit'
 {View, $, callRemoveHooks} = require 'space-pen'
-React = require 'react-atom-fork'
 Path = require 'path'
 {defaults} = require 'underscore-plus'
 TextBuffer = require 'text-buffer'
+Grim = require 'grim'
 TextEditor = require './text-editor'
 TextEditorComponent = require './text-editor-component'
 TextEditorView = null
@@ -21,7 +21,7 @@ class TextEditorElement extends HTMLElement
   createdCallback: ->
     @emitter = new Emitter
     @initializeContent()
-    @createSpacePenShim()
+    @createSpacePenShim() if Grim.includeDeprecatedAPIs
     @addEventListener 'focus', @focused.bind(this)
     @addEventListener 'blur', @blurred.bind(this)
 
@@ -61,12 +61,14 @@ class TextEditorElement extends HTMLElement
 
   attachedCallback: ->
     @buildModel() unless @getModel()?
-    @mountComponent() unless @component?.isMounted()
+    @mountComponent() unless @component?
     @component.checkForVisibilityChange()
-    @focus() if @focusOnAttach
+    if this is document.activeElement
+      @focused()
     @emitter.emit("did-attach")
 
   detachedCallback: ->
+    @unmountComponent()
     @emitter.emit("did-detach")
 
   initialize: (model) ->
@@ -85,7 +87,7 @@ class TextEditorElement extends HTMLElement
     @model.onDidChangeGrammar => @addGrammarScopeAttribute()
     @model.onDidChangeEncoding => @addEncodingAttribute()
     @model.onDidDestroy => @unmountComponent()
-    @__spacePenView.setModel(@model)
+    @__spacePenView.setModel(@model) if Grim.includeDeprecatedAPIs
     @model
 
   getModel: ->
@@ -98,43 +100,41 @@ class TextEditorElement extends HTMLElement
       tabLength: 2
       softTabs: true
       mini: @hasAttribute('mini')
+      lineNumberGutterVisible: not @hasAttribute('gutter-hidden')
       placeholderText: @getAttribute('placeholder-text')
     ))
 
   mountComponent: ->
-    @componentDescriptor ?= TextEditorComponent(
+    @component = new TextEditorComponent(
       hostElement: this
       rootElement: @rootElement
       stylesElement: @stylesElement
       editor: @model
-      mini: @model.mini
       lineOverdrawMargin: @lineOverdrawMargin
       useShadowDOM: @useShadowDOM
     )
-    @component = React.renderComponent(@componentDescriptor, @rootElement)
+    @rootElement.appendChild(@component.getDomNode())
 
     if @useShadowDOM
       @shadowRoot.addEventListener('blur', @shadowRootBlurred.bind(this), true)
     else
-      inputNode = @component.refs.input.getDOMNode()
+      inputNode = @component.hiddenInputComponent.getDomNode()
       inputNode.addEventListener 'focus', @focused.bind(this)
       inputNode.addEventListener 'blur', => @dispatchEvent(new FocusEvent('blur', bubbles: false))
 
   unmountComponent: ->
-    return unless @component?.isMounted()
     callRemoveHooks(this)
-    React.unmountComponentAtNode(@rootElement)
-    @component = null
+    if @component?
+      @component.destroy()
+      @component.getDomNode().remove()
+      @component = null
 
   focused: ->
-    if @component?
-      @component.focused()
-    else
-      @focusOnAttach = true
+    @component?.focused()
 
   blurred: (event) ->
     unless @useShadowDOM
-      if event.relatedTarget is @component?.refs.input?.getDOMNode()
+      if event.relatedTarget is @component.hiddenInputComponent.getDomNode()
         event.stopImmediatePropagation()
         return
 
@@ -172,6 +172,38 @@ class TextEditorElement extends HTMLElement
   # Returns a {Number} of pixels.
   getDefaultCharacterWidth: ->
     @getModel().getDefaultCharWidth()
+
+  # Extended: Converts a buffer position to a pixel position.
+  #
+  # * `bufferPosition` An object that represents a buffer position. It can be either
+  #   an {Object} (`{row, column}`), {Array} (`[row, column]`), or {Point}
+  #
+  # Returns an {Object} with two values: `top` and `left`, representing the pixel position.
+  pixelPositionForBufferPosition: (bufferPosition) ->
+    @getModel().pixelPositionForBufferPosition(bufferPosition, true)
+
+  # Extended: Converts a screen position to a pixel position.
+  #
+  # * `screenPosition` An object that represents a screen position. It can be either
+  #   an {Object} (`{row, column}`), {Array} (`[row, column]`), or {Point}
+  #
+  # Returns an {Object} with two values: `top` and `left`, representing the pixel positions.
+  pixelPositionForScreenPosition: (screenPosition) ->
+    @getModel().pixelPositionForScreenPosition(screenPosition, true)
+
+  # Extended: Retrieves the number of the row that is visible and currently at the
+  # top of the editor.
+  #
+  # Returns a {Number}.
+  getFirstVisibleScreenRow: ->
+    @getModel().getFirstVisibleScreenRow(true)
+
+  # Extended: Retrieves the number of the row that is visible and currently at the
+  # bottom of the editor.
+  #
+  # Returns a {Number}.
+  getLastVisibleScreenRow: ->
+    @getModel().getLastVisibleScreenRow(true)
 
   # Extended: call the given `callback` when the editor is attached to the DOM.
   #
@@ -212,6 +244,8 @@ atom.commands.add 'atom-text-editor', stopEventPropagation(
   'core:move-right': -> @moveRight()
   'core:select-left': -> @selectLeft()
   'core:select-right': -> @selectRight()
+  'core:select-up': -> @selectUp()
+  'core:select-down': -> @selectDown()
   'core:select-all': -> @selectAll()
   'editor:move-to-previous-word': -> @moveToPreviousWord()
   'editor:select-word': -> @selectWordsContainingCursors()
@@ -265,8 +299,6 @@ atom.commands.add 'atom-text-editor:not([mini])', stopEventPropagation(
   'core:move-to-bottom': -> @moveToBottom()
   'core:page-up': -> @pageUp()
   'core:page-down': -> @pageDown()
-  'core:select-up': -> @selectUp()
-  'core:select-down': -> @selectDown()
   'core:select-to-top': -> @selectToTop()
   'core:select-to-bottom': -> @selectToBottom()
   'core:select-page-up': -> @selectPageUp()
@@ -306,7 +338,7 @@ atom.commands.add 'atom-text-editor:not([mini])', stopEventPropagationAndGroupUn
   'editor:newline-below': -> @insertNewlineBelow()
   'editor:newline-above': -> @insertNewlineAbove()
   'editor:toggle-line-comments': -> @toggleLineCommentsInSelection()
-  'editor:checkout-head-revision': -> atom.project.getRepositories()[0]?.checkoutHeadForEditor(this)
+  'editor:checkout-head-revision': -> @checkoutHeadRevision()
   'editor:move-line-up': -> @moveLineUp()
   'editor:move-line-down': -> @moveLineDown()
   'editor:duplicate-lines': -> @duplicateLines()

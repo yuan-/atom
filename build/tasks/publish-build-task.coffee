@@ -68,7 +68,7 @@ getAssets = ->
       ]
     when 'win32'
       assets = [{assetName: 'atom-windows.zip', sourcePath: 'Atom'}]
-      for squirrelAsset in ['AtomSetup.exe', 'RELEASES', "atom-#{version}-full.nupkg"]
+      for squirrelAsset in ['AtomSetup.exe', 'RELEASES', "atom-#{version}-full.nupkg", "atom-#{version}-delta.nupkg"]
         cp path.join(buildDir, 'installer', squirrelAsset), path.join(buildDir, squirrelAsset)
         assets.push({assetName: squirrelAsset, sourcePath: assetName})
       assets
@@ -101,7 +101,7 @@ getAssets = ->
 logError = (message, error, details) ->
   grunt.log.error(message)
   grunt.log.error(error.message ? error) if error?
-  grunt.log.error(details) if details
+  grunt.log.error(require('util').inspect(details)) if details
 
 zipAssets = (buildDir, assets, callback) ->
   zip = (directory, sourcePath, assetName, callback) ->
@@ -142,7 +142,30 @@ getAtomDraftRelease = (callback) ->
             firstDraft.assets = assets
             callback(null, firstDraft)
       else
-        callback(new Error('No draft release in atom/atom repo'))
+        createAtomDraftRelease(callback)
+
+createAtomDraftRelease = (callback) ->
+  {version} = require('../../package.json')
+  options =
+    uri: 'https://api.github.com/repos/atom/atom/releases'
+    method: 'POST'
+    headers: defaultHeaders
+    json:
+      tag_name: "v#{version}"
+      name: version
+      draft: true
+      body: """
+        ### Notable Changes
+
+        * Something new
+      """
+
+  request options, (error, response, body='') ->
+    if error? or response.statusCode isnt 201
+      logError("Creating atom/atom draft release failed", error, body)
+      callback(error ? new Error(response.statusCode))
+    else
+      callback(null, body)
 
 deleteRelease = (release) ->
   options =

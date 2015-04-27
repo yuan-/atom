@@ -1,4 +1,5 @@
 {Emitter, CompositeDisposable} = require 'event-kit'
+{includeDeprecatedAPIs} = require 'grim'
 
 class StylesElement extends HTMLElement
   subscriptions: null
@@ -18,7 +19,7 @@ class StylesElement extends HTMLElement
     @styleElementClonesByOriginalElement = new WeakMap
 
   attachedCallback: ->
-    if @context is 'atom-text-editor'
+    if includeDeprecatedAPIs and @context is 'atom-text-editor'
       for styleElement in @children
         @upgradeDeprecatedSelectors(styleElement)
     @initialize()
@@ -46,6 +47,7 @@ class StylesElement extends HTMLElement
     @styleElementRemoved(child) for child in Array::slice.call(@children)
     @context = @getAttribute('context')
     @styleElementAdded(styleElement) for styleElement in atom.styles.getStyleElements()
+    return
 
   styleElementAdded: (styleElement) ->
     return unless @styleElementMatchesContext(styleElement)
@@ -53,18 +55,19 @@ class StylesElement extends HTMLElement
     styleElementClone = styleElement.cloneNode(true)
     styleElementClone.sourcePath = styleElement.sourcePath
     styleElementClone.context = styleElement.context
+    styleElementClone.priority = styleElement.priority
     @styleElementClonesByOriginalElement.set(styleElement, styleElementClone)
 
-    group = styleElement.getAttribute('group')
-    if group?
+    priority = styleElement.priority
+    if priority?
       for child in @children
-        if child.getAttribute('group') is group and child.nextSibling?.getAttribute('group') isnt group
-          insertBefore = child.nextSibling
+        if child.priority > priority
+          insertBefore = child
           break
 
     @insertBefore(styleElementClone, insertBefore)
 
-    if @context is 'atom-text-editor'
+    if includeDeprecatedAPIs and @context is 'atom-text-editor'
       @upgradeDeprecatedSelectors(styleElementClone)
 
     @emitter.emit 'did-add-style-element', styleElementClone

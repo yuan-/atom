@@ -4,7 +4,6 @@ Q = require 'q'
 _ = require 'underscore-plus'
 Delegator = require 'delegato'
 {deprecate, logDeprecationWarnings} = require 'grim'
-scrollbarStyle = require 'scrollbar-style'
 {$, $$, View} = require './space-pen-extensions'
 fs = require 'fs-plus'
 Workspace = require './workspace'
@@ -52,7 +51,7 @@ module.exports =
 class WorkspaceView extends View
   Delegator.includeInto(this)
 
-  @delegatesProperty 'fullScreen', 'destroyedItemUris', toProperty: 'model'
+  @delegatesProperty 'fullScreen', 'destroyedItemURIs', toProperty: 'model'
   @delegatesMethods 'open', 'openSync',
     'saveActivePaneItem', 'saveActivePaneItemAs', 'saveAll', 'destroyActivePaneItem',
     'destroyActivePane', 'increaseFontSize', 'decreaseFontSize', toProperty: 'model'
@@ -62,6 +61,7 @@ class WorkspaceView extends View
       return atom.views.getView(atom.workspace).__spacePenView
     super
     @deprecateViewEvents()
+    @attachedEditorViews = new WeakSet
 
   setModel: (@model) ->
     @horizontal = @find('atom-workspace-axis.horizontal')
@@ -95,10 +95,17 @@ class WorkspaceView extends View
   # Returns a subscription object with an `.off` method that you can call to
   # unregister the callback.
   eachEditorView: (callback) ->
-    callback(editorView) for editorView in @getEditorViews()
-    attachedCallback = (e, editorView) ->
-      callback(editorView) unless editorView.mini
+    for editorView in @getEditorViews()
+      @attachedEditorViews.add(editorView)
+      callback(editorView)
+
+    attachedCallback = (e, editorView) =>
+      unless @attachedEditorViews.has(editorView)
+        @attachedEditorViews.add(editorView)
+        callback(editorView) unless editorView.mini
+
     @on('editor:attached', attachedCallback)
+
     off: => @off('editor:attached', attachedCallback)
 
   # Essential: Register a function to be called for every current and future
@@ -213,7 +220,6 @@ class WorkspaceView extends View
   getEditorViews: ->
     for editorElement in @panes.element.querySelectorAll('atom-pane > .item-views > atom-text-editor')
       $(editorElement).view()
-
 
   ###
   Section: Deprecated

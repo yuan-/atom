@@ -3,19 +3,18 @@ ipc = require 'ipc'
 os = require 'os'
 path = require 'path'
 remote = require 'remote'
-screen = require 'screen'
 shell = require 'shell'
 
 _ = require 'underscore-plus'
-{deprecate} = require 'grim'
-{Emitter} = require 'event-kit'
-{Model} = require 'theorist'
+{deprecate, includeDeprecatedAPIs} = require 'grim'
+{CompositeDisposable, Emitter} = require 'event-kit'
 fs = require 'fs-plus'
 {convertStackTrace, convertLine} = require 'coffeestack'
-
+Model = require './model'
 {$} = require './space-pen-extensions'
 WindowEventHandler = require './window-event-handler'
 StylesElement = require './styles-element'
+StorageFolder = require './storage-folder'
 
 # Essential: Atom global for dealing with packages, themes, menus, and the window.
 #
@@ -35,21 +34,36 @@ class Atom extends Model
     atom = @deserialize(@loadState(mode)) ? new this({mode, @version})
     atom.deserializeTimings.atom = Date.now() -  startTime
 
-    workspaceViewDeprecationMessage = """
-      atom.workspaceView is no longer available.
-      In most cases you will not need the view. See the Workspace docs for
-      alternatives: https://atom.io/docs/api/latest/Workspace.
-      If you do need the view, please use `atom.views.getView(atom.workspace)`,
-      which returns an HTMLElement.
-    """
+    if includeDeprecatedAPIs
+      workspaceViewDeprecationMessage = """
+        atom.workspaceView is no longer available.
+        In most cases you will not need the view. See the Workspace docs for
+        alternatives: https://atom.io/docs/api/latest/Workspace.
+        If you do need the view, please use `atom.views.getView(atom.workspace)`,
+        which returns an HTMLElement.
+      """
 
-    Object.defineProperty atom, 'workspaceView',
-      get: ->
-        deprecate(workspaceViewDeprecationMessage)
-        atom.__workspaceView
-      set: (newValue) ->
-        deprecate(workspaceViewDeprecationMessage)
-        atom.__workspaceView = newValue
+      serviceHubDeprecationMessage = """
+        atom.services is no longer available. To register service providers and
+        consumers, use the `providedServices` and `consumedServices` fields in
+        your package's package.json.
+      """
+
+      Object.defineProperty atom, 'workspaceView',
+        get: ->
+          deprecate(workspaceViewDeprecationMessage)
+          atom.__workspaceView
+        set: (newValue) ->
+          deprecate(workspaceViewDeprecationMessage)
+          atom.__workspaceView = newValue
+
+      Object.defineProperty atom, 'services',
+        get: ->
+          deprecate(serviceHubDeprecationMessage)
+          atom.packages.serviceHub
+        set: (newValue) ->
+          deprecate(serviceHubDeprecationMessage)
+          atom.packages.serviceHub = newValue
 
     atom
 
@@ -60,35 +74,24 @@ class Atom extends Model
   # Loads and returns the serialized state corresponding to this window
   # if it exists; otherwise returns undefined.
   @loadState: (mode) ->
-    statePath = @getStatePath(mode)
+    if stateKey = @getStateKey(@getLoadSettings().initialPaths, mode)
+      if state = @getStorageFolder().load(stateKey)
+        return state
 
-    if fs.existsSync(statePath)
+    if windowState = @getLoadSettings().windowState
       try
-        stateString = fs.readFileSync(statePath, 'utf8')
+        JSON.parse(@getLoadSettings().windowState)
       catch error
-        console.warn "Error reading window state: #{statePath}", error.stack, error
-    else
-      stateString = @getLoadSettings().windowState
-
-    try
-      JSON.parse(stateString) if stateString?
-    catch error
-      console.warn "Error parsing window state: #{statePath} #{error.stack}", error
+        console.warn "Error parsing window state: #{statePath} #{error.stack}", error
 
   # Returns the path where the state for the current window will be
   # located if it exists.
-  @getStatePath: (mode) ->
-    switch mode
-      when 'spec'
-        filename = 'spec'
-      when 'editor'
-        {initialPath} = @getLoadSettings()
-        if initialPath
-          sha1 = crypto.createHash('sha1').update(initialPath).digest('hex')
-          filename = "editor-#{sha1}"
-
-    if filename
-      path.join(@getStorageDirPath(), filename)
+  @getStateKey: (paths, mode) ->
+    if mode is 'spec'
+      'spec'
+    else if mode is 'editor' and paths?.length > 0
+      sha1 = crypto.createHash('sha1').update(paths.slice().sort().join("\n")).digest('hex')
+      "editor-#{sha1}"
     else
       null
 
@@ -96,17 +99,14 @@ class Atom extends Model
   #
   # Returns the absolute path to ~/.atom
   @getConfigDirPath: ->
-    @configDirPath ?= fs.absolute('~/.atom')
+    @configDirPath ?= process.env.ATOM_HOME
 
-  # Get the path to Atom's storage directory.
-  #
-  # Returns the absolute path to ~/.atom/storage
-  @getStorageDirPath: ->
-    @storageDirPath ?= path.join(@getConfigDirPath(), 'storage')
+  @getStorageFolder: ->
+    @storageFolder ?= new StorageFolder(@getConfigDirPath())
 
   # Returns the load settings hash associated with the current window.
   @getLoadSettings: ->
-    @loadSettings ?= JSON.parse(decodeURIComponent(location.search.substr(14)))
+    @loadSettings ?= JSON.parse(decodeURIComponent(location.hash.substr(1)))
     cloned = _.deepClone(@loadSettings)
     # The loadSettings.windowState could be large, request it only when needed.
     cloned.__defineGetter__ 'windowState', =>
@@ -114,6 +114,11 @@ class Atom extends Model
     cloned.__defineSetter__ 'windowState', (value) =>
       @getCurrentWindow().loadSettings.windowState = value
     cloned
+
+  @updateLoadSetting: (key, value) ->
+    @getLoadSettings()
+    @loadSettings[key] = value
+    location.hash = encodeURIComponent(JSON.stringify(@loadSettings))
 
   @getCurrentWindow: ->
     remote.getCurrentWindow()
@@ -134,9 +139,6 @@ class Atom extends Model
   # Public: A {Clipboard} instance
   clipboard: null
 
-  # A {ServiceHub} instance
-  services: null
-
   # Public: A {ContextMenuManager} instance
   contextMenu: null
 
@@ -149,7 +151,7 @@ class Atom extends Model
   # Public: A {TooltipManager} instance
   tooltips: null
 
-  # Experimental: A {NotificationManager} instance
+  # Public: A {NotificationManager} instance
   notifications: null
 
   # Public: A {Project} instance
@@ -183,6 +185,7 @@ class Atom extends Model
   # Call .loadOrCreate instead
   constructor: (@state) ->
     @emitter = new Emitter
+    @disposables = new CompositeDisposable
     {@mode} = @state
     DeserializerManager = require './deserializer-manager'
     @deserializers = new DeserializerManager()
@@ -193,12 +196,6 @@ class Atom extends Model
   #
   # Call after this instance has been assigned to the `atom` global.
   initialize: ->
-    # Disable deprecations unless in dev mode or spec mode so that regular
-    # editor performance isn't impacted by generating stack traces for
-    # deprecated calls.
-    unless @inDevMode() or @inSpecMode()
-      require('grim').deprecate = ->
-
     sourceMapCache = {}
 
     window.onerror = =>
@@ -218,12 +215,14 @@ class Atom extends Model
 
       if openDevTools
         @openDevTools()
-        @executeJavaScriptInDevTools('InspectorFrontendAPI.showConsole()')
+        @executeJavaScriptInDevTools('DevToolsAPI.showConsole()')
 
-      @emit 'uncaught-error', arguments...
+      @emit 'uncaught-error', arguments... if includeDeprecatedAPIs
       @emitter.emit 'did-throw-error', {message, url, line, column, originalError}
 
-    @unsubscribe()
+    @disposables?.dispose()
+    @disposables = new CompositeDisposable
+
     @setBodyPlatformClass()
 
     @loadTime = null
@@ -236,7 +235,6 @@ class Atom extends Model
     NotificationManager = require './notification-manager'
     PackageManager = require './package-manager'
     Clipboard = require './clipboard'
-    ServiceHub = require './service-hub'
     GrammarRegistry = require './grammar-registry'
     ThemeManager = require './theme-manager'
     StyleManager = require './style-manager'
@@ -254,12 +252,12 @@ class Atom extends Model
     # Make react.js faster
     process.env.NODE_ENV ?= 'production' unless devMode
 
-    # Set Atom's home so packages don't have to guess it
-    process.env.ATOM_HOME = configDirPath
-
     @config = new Config({configDirPath, resourcePath})
     @keymaps = new KeymapManager({configDirPath, resourcePath})
-    @keymap = @keymaps # Deprecated
+
+    if includeDeprecatedAPIs
+      @keymap = @keymaps # Deprecated
+
     @keymaps.subscribeToFileReadFailure()
     @tooltips = new TooltipManager
     @notifications = new NotificationManager
@@ -272,15 +270,15 @@ class Atom extends Model
     @contextMenu = new ContextMenuManager({resourcePath, devMode})
     @menu = new MenuManager({resourcePath})
     @clipboard = new Clipboard()
-    @services = new ServiceHub
 
     @grammars = @deserializers.deserialize(@state.grammars ? @state.syntax) ? new GrammarRegistry()
 
-    Object.defineProperty this, 'syntax', get: ->
-      deprecate "The atom.syntax global is deprecated. Use atom.grammars instead."
-      @grammars
+    if includeDeprecatedAPIs
+      Object.defineProperty this, 'syntax', get: ->
+        deprecate "The atom.syntax global is deprecated. Use atom.grammars instead."
+        @grammars
 
-    @subscribe @packages.onDidActivateAll => @watchThemes()
+    @disposables.add @packages.onDidActivateInitialPackages => @watchThemes()
 
     Project = require './project'
     TextBuffer = require 'text-buffer'
@@ -339,15 +337,15 @@ class Atom extends Model
 
   # Public: Is the current window in development mode?
   inDevMode: ->
-    @getLoadSettings().devMode
+    @devMode ?= @getLoadSettings().devMode
 
   # Public: Is the current window in safe mode?
   inSafeMode: ->
-    @getLoadSettings().safeMode
+    @safeMode ?= @getLoadSettings().safeMode
 
   # Public: Is the current window running specs?
   inSpecMode: ->
-    @getLoadSettings().isSpec
+    @specMode ?= @getLoadSettings().isSpec
 
   # Public: Get the version of the Atom application.
   #
@@ -401,6 +399,18 @@ class Atom extends Model
   #     mode prevents all packages installed to ~/.atom/packages from loading.
   open: (options) ->
     ipc.send('open', options)
+
+  # Extended: Prompt the user to select one or more folders.
+  #
+  # * `callback` A {Function} to call once the user has confirmed the selection.
+  #   * `paths` An {Array} of {String} paths that the user selected, or `null`
+  #     if the user dismissed the dialog.
+  pickFolder: (callback) ->
+    responseChannel = "atom-pick-folder-response"
+    ipc.on responseChannel, (path) ->
+      ipc.removeAllListeners(responseChannel)
+      callback(path)
+    ipc.send("pick-folder", responseChannel)
 
   # Essential: Close the current window.
   close: ->
@@ -477,7 +487,7 @@ class Atom extends Model
 
   # Extended: Toggle the full screen state of the current window.
   toggleFullScreen: ->
-    @setFullScreen(!@isFullScreen())
+    @setFullScreen(not @isFullScreen())
 
   # Schedule the window to be shown and focused on the next tick.
   #
@@ -547,6 +557,7 @@ class Atom extends Model
     if @isValidDimensions(dimensions)
       dimensions
     else
+      screen = remote.require 'screen'
       {width, height} = screen.getPrimaryDisplay().workAreaSize
       {x: 0, y: 0, width: Math.min(1024, width), height}
 
@@ -563,12 +574,12 @@ class Atom extends Model
 
   # Call this method when establishing a real application window.
   startEditorWindow: ->
-    {resourcePath, safeMode} = @getLoadSettings()
+    {safeMode} = @getLoadSettings()
 
     CommandInstaller = require './command-installer'
-    CommandInstaller.installAtomCommand resourcePath, false, (error) ->
+    CommandInstaller.installAtomCommand false, (error) ->
       console.warn error.message if error?
-    CommandInstaller.installApmCommand resourcePath, false, (error) ->
+    CommandInstaller.installApmCommand false, (error) ->
       console.warn error.message if error?
 
     dimensions = @restoreWindowDimensions()
@@ -585,9 +596,11 @@ class Atom extends Model
     @requireUserInitScript() unless safeMode
 
     @menu.update()
-    @subscribe @config.onDidChange 'core.autoHideMenuBar', ({newValue}) =>
+    @disposables.add @config.onDidChange 'core.autoHideMenuBar', ({newValue}) =>
       @setAutoHideMenuBar(newValue)
     @setAutoHideMenuBar(true) if @config.get('core.autoHideMenuBar')
+
+    @openInitialEmptyEditorIfNecessary()
 
     maximize = dimensions?.maximized and process.platform isnt 'darwin'
     @displayWindow({maximize})
@@ -612,6 +625,10 @@ class Atom extends Model
     @project = null
 
     @windowEventHandler?.unsubscribe()
+
+  openInitialEmptyEditorIfNecessary: ->
+    if @getLoadSettings().initialPaths?.length is 0 and @workspace.getPaneItems().length is 0
+      @workspace.open(null)
 
   ###
   Section: Messaging the User
@@ -687,18 +704,23 @@ class Atom extends Model
     Project = require './project'
 
     startTime = Date.now()
-    @project ?= @deserializers.deserialize(@state.project) ? new Project(paths: [@getLoadSettings().initialPath])
+    @project ?= @deserializers.deserialize(@state.project) ? new Project()
     @deserializeTimings.project = Date.now() - startTime
 
   deserializeWorkspaceView: ->
     Workspace = require './workspace'
-    WorkspaceView = require './workspace-view'
+
+    if includeDeprecatedAPIs
+      WorkspaceView = require './workspace-view'
 
     startTime = Date.now()
     @workspace = Workspace.deserialize(@state.workspace) ? new Workspace
 
     workspaceElement = @views.getView(@workspace)
-    @__workspaceView = workspaceElement.__spacePenView
+
+    if includeDeprecatedAPIs
+      @__workspaceView = workspaceElement.__spacePenView
+
     @deserializeTimings.workspace = Date.now() - startTime
 
     @keymaps.defaultTarget = workspaceElement
@@ -721,7 +743,7 @@ class Atom extends Model
     @themes.load()
 
   watchThemes: ->
-    @themes.onDidReloadAll =>
+    @themes.onDidChangeActiveThemes =>
       # Only reload stylesheets from non-theme packages
       for pack in @packages.getActivePackages() when pack.getType() isnt 'theme'
         pack.reloadStylesheets?()
@@ -729,10 +751,8 @@ class Atom extends Model
 
   # Notify the browser project of the window's current project path
   watchProjectPath: ->
-    onProjectPathChanged = =>
-      ipc.send('window-command', 'project-path-changed', @project.getPaths()[0])
-    @subscribe @project.onDidChangePaths(onProjectPathChanged)
-    onProjectPathChanged()
+    @disposables.add @project.onDidChangePaths =>
+      @constructor.updateLoadSetting('initialPaths', @project.getPaths())
 
   exit: (status) ->
     app = remote.require('app')
@@ -745,21 +765,24 @@ class Atom extends Model
   setRepresentedFilename: (filename) ->
     ipc.send('call-window-method', 'setRepresentedFilename', filename)
 
+  addProjectFolder: ->
+    @pickFolder (selectedPaths = []) =>
+      @project.addPath(selectedPath) for selectedPath in selectedPaths
+
   showSaveDialog: (callback) ->
     callback(showSaveDialogSync())
 
   showSaveDialogSync: (defaultPath) ->
-    defaultPath ?= @project?.getPath()
+    defaultPath ?= @project?.getPaths()[0]
     currentWindow = @getCurrentWindow()
     dialog = remote.require('dialog')
     dialog.showSaveDialog currentWindow, {title: 'Save File', defaultPath}
 
   saveSync: ->
-    stateString = JSON.stringify(@state)
-    if statePath = @constructor.getStatePath(@mode)
-      fs.writeFileSync(statePath, stateString, 'utf8')
+    if storageKey = @constructor.getStateKey(@project?.getPaths(), @mode)
+      @constructor.getStorageFolder().store(storageKey, @state)
     else
-      @getCurrentWindow().loadSettings.windowState = stateString
+      @getCurrentWindow().loadSettings.windowState = JSON.stringify(@state)
 
   crashMainProcess: ->
     remote.process.crash()
@@ -776,7 +799,9 @@ class Atom extends Model
       try
         require(userInitScriptPath) if fs.isFileSync(userInitScriptPath)
       catch error
-        console.error "Failed to load `#{userInitScriptPath}`", error.stack, error
+        atom.notifications.addError "Failed to load `#{userInitScriptPath}`",
+          detail: error.message
+          dismissable: true
 
   # Require the module with the given globals.
   #
@@ -784,7 +809,7 @@ class Atom extends Model
   # require completes.
   #
   # * `id` The {String} module name or path.
-  # * `globals` An optinal {Object} to set as globals during require.
+  # * `globals` An optional {Object} to set as globals during require.
   requireWithGlobals: (id, globals={}) ->
     existingGlobals = {}
     for key, value of globals
@@ -798,6 +823,7 @@ class Atom extends Model
         delete window[key]
       else
         window[key] = value
+    return
 
   onUpdateAvailable: (callback) ->
     @emitter.on 'update-available', callback
@@ -805,17 +831,18 @@ class Atom extends Model
   updateAvailable: (details) ->
     @emitter.emit 'update-available', details
 
-  # Deprecated: Callers should be converted to use atom.deserializers
-  registerRepresentationClass: ->
-    deprecate("Callers should be converted to use atom.deserializers")
-
-  # Deprecated: Callers should be converted to use atom.deserializers
-  registerRepresentationClasses: ->
-    deprecate("Callers should be converted to use atom.deserializers")
-
   setBodyPlatformClass: ->
     document.body.classList.add("platform-#{process.platform}")
 
   setAutoHideMenuBar: (autoHide) ->
     ipc.send('call-window-method', 'setAutoHideMenuBar', autoHide)
-    ipc.send('call-window-method', 'setMenuBarVisibility', !autoHide)
+    ipc.send('call-window-method', 'setMenuBarVisibility', not autoHide)
+
+if includeDeprecatedAPIs
+  # Deprecated: Callers should be converted to use atom.deserializers
+  Atom::registerRepresentationClass = ->
+    deprecate("Callers should be converted to use atom.deserializers")
+
+  # Deprecated: Callers should be converted to use atom.deserializers
+  Atom::registerRepresentationClasses = ->
+    deprecate("Callers should be converted to use atom.deserializers")

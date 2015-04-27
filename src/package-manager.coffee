@@ -1,12 +1,12 @@
 path = require 'path'
 
 _ = require 'underscore-plus'
-EmitterMixin = require('emissary').Emitter
 {Emitter} = require 'event-kit'
 fs = require 'fs-plus'
 Q = require 'q'
-{deprecate} = require 'grim'
+Grim = require 'grim'
 
+ServiceHub = require 'service-hub'
 Package = require './package'
 ThemePackage = require './theme-package'
 
@@ -27,8 +27,6 @@ ThemePackage = require './theme-package'
 # settings and also by calling `enablePackage()/disablePackage()`.
 module.exports =
 class PackageManager
-  EmitterMixin.includeInto(this)
-
   constructor: ({configDirPath, @devMode, safeMode, @resourcePath}) ->
     @emitter = new Emitter
     @packageDirPaths = []
@@ -40,6 +38,7 @@ class PackageManager
     @loadedPackages = {}
     @activePackages = {}
     @packageStates = {}
+    @serviceHub = new ServiceHub
 
     @packageActivators = []
     @registerPackageActivator(this, ['atom', 'textmate'])
@@ -48,31 +47,57 @@ class PackageManager
   Section: Event Subscription
   ###
 
-  # Public: Invoke the given callback when all packages have been activated.
+  # Public: Invoke the given callback when all packages have been loaded.
   #
   # * `callback` {Function}
   #
   # Returns a {Disposable} on which `.dispose()` can be called to unsubscribe.
-  onDidLoadAll: (callback) ->
-    @emitter.on 'did-load-all', callback
+  onDidLoadInitialPackages: (callback) ->
+    @emitter.on 'did-load-initial-packages', callback
 
   # Public: Invoke the given callback when all packages have been activated.
   #
   # * `callback` {Function}
   #
   # Returns a {Disposable} on which `.dispose()` can be called to unsubscribe.
-  onDidActivateAll: (callback) ->
-    @emitter.on 'did-activate-all', callback
+  onDidActivateInitialPackages: (callback) ->
+    @emitter.on 'did-activate-initial-packages', callback
 
-  on: (eventName) ->
-    switch eventName
-      when 'loaded'
-        deprecate 'Use PackageManager::onDidLoadAll instead'
-      when 'activated'
-        deprecate 'Use PackageManager::onDidActivateAll instead'
-      else
-        deprecate 'PackageManager::on is deprecated. Use event subscription methods instead.'
-    EmitterMixin::on.apply(this, arguments)
+  # Public: Invoke the given callback when a package is activated.
+  #
+  # * `callback` A {Function} to be invoked when a package is activated.
+  #   * `package` The {Package} that was activated.
+  #
+  # Returns a {Disposable} on which `.dispose()` can be called to unsubscribe.
+  onDidActivatePackage: (callback) ->
+    @emitter.on 'did-activate-package', callback
+
+  # Public: Invoke the given callback when a package is deactivated.
+  #
+  # * `callback` A {Function} to be invoked when a package is deactivated.
+  #   * `package` The {Package} that was deactivated.
+  #
+  # Returns a {Disposable} on which `.dispose()` can be called to unsubscribe.
+  onDidDeactivatePackage: (callback) ->
+    @emitter.on 'did-deactivate-package', callback
+
+  # Public: Invoke the given callback when a package is loaded.
+  #
+  # * `callback` A {Function} to be invoked when a package is loaded.
+  #   * `package` The {Package} that was loaded.
+  #
+  # Returns a {Disposable} on which `.dispose()` can be called to unsubscribe.
+  onDidLoadPackage: (callback) ->
+    @emitter.on 'did-load-package', callback
+
+  # Public: Invoke the given callback when a package is unloaded.
+  #
+  # * `callback` A {Function} to be invoked when a package is unloaded.
+  #   * `package` The {Package} that was unloaded.
+  #
+  # Returns a {Disposable} on which `.dispose()` can be called to unsubscribe.
+  onDidUnloadPackage: (callback) ->
+    @emitter.on 'did-unload-package', callback
 
   ###
   Section: Package system data
@@ -82,9 +107,15 @@ class PackageManager
   #
   # Return a {String} file path to apm.
   getApmPath: ->
+    return @apmPath if @apmPath?
+
     commandName = 'apm'
     commandName += '.cmd' if process.platform is 'win32'
-    @apmPath ?= path.resolve(__dirname, '..', 'apm', 'node_modules', 'atom-package-manager', 'bin', commandName)
+    apmRoot = path.join(process.resourcesPath, 'app', 'apm')
+    @apmPath = path.join(apmRoot, 'bin', commandName)
+    unless fs.isFileSync(@apmPath)
+      @apmPath = path.join(apmRoot, 'node_modules', 'atom-package-manager', 'bin', commandName)
+    @apmPath
 
   # Public: Get the paths being used to look for packages.
   #
@@ -245,8 +276,7 @@ class PackageManager
   getPackageDependencies: ->
     unless @packageDependencies?
       try
-        metadataPath = path.join(@resourcePath, 'package.json')
-        {@packageDependencies} = JSON.parse(fs.readFileSync(metadataPath)) ? {}
+        @packageDependencies = require('../package.json')?.packageDependencies
       @packageDependencies ?= {}
 
     @packageDependencies
@@ -277,8 +307,8 @@ class PackageManager
     packagePaths = packagePaths.filter (packagePath) => not @isPackageDisabled(path.basename(packagePath))
     packagePaths = _.uniq packagePaths, (packagePath) -> path.basename(packagePath)
     @loadPackage(packagePath) for packagePath in packagePaths
-    @emit 'loaded'
-    @emitter.emit 'did-load-all'
+    @emit 'loaded' if Grim.includeDeprecatedAPIs
+    @emitter.emit 'did-load-initial-packages'
 
   loadPackage: (nameOrPath) ->
     return pack if pack = @getLoadedPackage(nameOrPath)
@@ -289,15 +319,18 @@ class PackageManager
 
       try
         metadata = Package.loadMetadata(packagePath) ? {}
-        if metadata.theme
-          pack = new ThemePackage(packagePath, metadata)
-        else
-          pack = new Package(packagePath, metadata)
-        pack.load()
-        @loadedPackages[pack.name] = pack
-        return pack
       catch error
-        console.warn "Failed to load package.json '#{path.basename(packagePath)}'", error.stack ? error
+        @handleMetadataError(error, packagePath)
+        return null
+
+      if metadata.theme
+        pack = new ThemePackage(packagePath, metadata)
+      else
+        pack = new Package(packagePath, metadata)
+      pack.load()
+      @loadedPackages[pack.name] = pack
+      @emitter.emit 'did-load-package', pack
+      return pack
     else
       console.warn "Could not resolve '#{nameOrPath}' to a package path"
     null
@@ -312,16 +345,19 @@ class PackageManager
 
     if pack = @getLoadedPackage(name)
       delete @loadedPackages[pack.name]
+      @emitter.emit 'did-unload-package', pack
     else
       throw new Error("No loaded package for name '#{name}'")
 
   # Activate all the packages that should be activated.
   activate: ->
+    promises = []
     for [activator, types] in @packageActivators
       packages = @getLoadedPackagesForTypes(types)
-      activator.activatePackages(packages)
-    @emit 'activated'
-    @emitter.emit 'did-activate-all'
+      promises = promises.concat(activator.activatePackages(packages))
+    Q.all(promises).then =>
+      @emit 'activated' if Grim.includeDeprecatedAPIs
+      @emitter.emit 'did-activate-initial-packages'
 
   # another type of package manager can handle other package types.
   # See ThemeManager
@@ -329,9 +365,14 @@ class PackageManager
     @packageActivators.push([activator, types])
 
   activatePackages: (packages) ->
+    promises = []
     atom.config.transact =>
-      @activatePackage(pack.name) for pack in packages
+      for pack in packages
+        promise = @activatePackage(pack.name)
+        promises.push(promise) unless pack.hasActivationCommands()
+      return
     @observeDisabledPackages()
+    promises
 
   # Activate a single package by name
   activatePackage: (name) ->
@@ -340,6 +381,7 @@ class PackageManager
     else if pack = @loadPackage(name)
       pack.activate().then =>
         @activePackages[pack.name] = pack
+        @emitter.emit 'did-activate-package', pack
         pack
     else
       Q.reject(new Error("Failed to load package '#{name}'"))
@@ -348,6 +390,7 @@ class PackageManager
   deactivatePackages: ->
     atom.config.transact =>
       @deactivatePackage(pack.name) for pack in @getLoadedPackages()
+      return
     @unobserveDisabledPackages()
 
   # Deactivate the package with the given name
@@ -357,3 +400,33 @@ class PackageManager
       @setPackageState(pack.name, state) if state = pack.serialize?()
     pack.deactivate()
     delete @activePackages[pack.name]
+    @emitter.emit 'did-deactivate-package', pack
+
+  handleMetadataError: (error, packagePath) ->
+    metadataPath = path.join(packagePath, 'package.json')
+    detail = "#{error.message} in #{metadataPath}"
+    stack = "#{error.stack}\n  at #{metadataPath}:1:1"
+    message = "Failed to load the #{path.basename(packagePath)} package"
+    atom.notifications.addError(message, {stack, detail, dismissable: true})
+
+if Grim.includeDeprecatedAPIs
+  EmitterMixin = require('emissary').Emitter
+  EmitterMixin.includeInto(PackageManager)
+
+  PackageManager::on = (eventName) ->
+    switch eventName
+      when 'loaded'
+        Grim.deprecate 'Use PackageManager::onDidLoadInitialPackages instead'
+      when 'activated'
+        Grim.deprecate 'Use PackageManager::onDidActivateInitialPackages instead'
+      else
+        Grim.deprecate 'PackageManager::on is deprecated. Use event subscription methods instead.'
+    EmitterMixin::on.apply(this, arguments)
+
+  PackageManager::onDidLoadAll = (callback) ->
+    Grim.deprecate("Use `::onDidLoadInitialPackages` instead.")
+    @onDidLoadInitialPackages(callback)
+
+  PackageManager::onDidActivateAll = (callback) ->
+    Grim.deprecate("Use `::onDidActivateInitialPackages` instead.")
+    @onDidActivateInitialPackages(callback)
